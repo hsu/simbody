@@ -50,6 +50,22 @@ static Real multRowTimesActiveCol(const Matrix& A, MultiplierIndex row,
     return result;
 }
 
+// Multiply the active entries of a row of the full matrix A (mXm) by a sparse,
+// full-length (m) column containing only the indicated non-zero entries. 
+// Useful for A[r]*piExpand.
+static Real multRowTimesSparseCol(const Matrix& A, MultiplierIndex row, 
+           const Array_<MultiplierIndex>& nonZero,
+           const Vector& sparseCol) 
+{
+    const RowVectorView Ar = A[row];
+    Real result = 0;
+    for (unsigned nz(0); nz < nonZero.size(); ++nz) {
+        const MultiplierIndex mx = nonZero[nz];
+        result += Ar[mx] * sparseCol[mx];
+    }
+    return result;
+}
+
 // Unpack an active column vector and add its values into a full column.
 static void addInActiveCol
    (const Array_<MultiplierIndex,PLUSImpulseSolver::ActiveIndex>& active,
@@ -112,28 +128,53 @@ namespace SimTK {
 //                   PLUS SUCCESSIVE PRUNING IMPULSE SOLVER
 //==============================================================================
 
+
+//------------------------------------------------------------------------------
+//                                SOLVE
+//------------------------------------------------------------------------------
+
 bool PLUSImpulseSolver::
 solve(int                                 phase,
-      const Array_<MultiplierIndex>&      participating, // p<=m of these 
-      const Matrix&                       A,     // m X m, symmetric
-      const Vector&                       D,     // m, diag >= 0 added to A
-      const Vector&                       rhs,   // m, RHS
-      Vector&                             pi,    // m, initial guess & result
+      const Array_<MultiplierIndex>&      participating, 
+      const Matrix&                       A,
+      const Vector&                       D,
+      const Array_<MultiplierIndex>&      expanding,
+      Vector&                             piExpand, // in/out
+      Vector&                             verrStart,     // in/out
+      Vector&                             verrApplied,
+      Vector&                             pi, 
       Array_<UncondRT>&                   unconditional,
-      Array_<UniContactRT>&               uniContact, // with friction
+      Array_<UniContactRT>&               uniContact,
       Array_<UniSpeedRT>&                 uniSpeed,
       Array_<BoundedRT>&                  bounded,
       Array_<ConstraintLtdFrictionRT>&    consLtdFriction,
       Array_<StateLtdFrictionRT>&         stateLtdFriction
       ) const 
 {
+    // If we get this close to taking a whole sliding interval, we'll just
+    // take the whole thing to avoid a final sliver of a step.
+    const Real MaxPartialSlidingStepLength = (1-SqrtEps);
+
     SimTK_DEBUG("\n--------------------------------\n");
     SimTK_DEBUG(  "START SUCCESSIVE PRUNING SOLVER:\n");
-    const int m=A.nrow();
-    assert(A.ncol()==m); assert(rhs.nrow()==m); assert(pi.nrow()==m);
+    ++m_nSolves[phase];
 
+    const int m=A.nrow(); assert(A.ncol()==m); 
+    assert(D.size()==m);
+    assert(verrStart.size()==m);
+    assert(verrApplied.size()==0 || verrApplied.size()==m);
+    assert(piExpand.size()==m);
+
+    // These are not mutually exclusive; a contact can be in both lists.
     const int p = (int)participating.size();
-    assert(p<=m);
+    const int nx = (int)expanding.size();
+    assert(p<=m); assert(nx<=m);
+ 
+    pi.resize(m);
+    pi.setToZero(); // Use this for piUnknown
+
+    const bool hasAppliedImpulse = (verrApplied.size() > 0);
+
 
     // Partitions of selected subset.
     const int mUncond   = (int)unconditional.size();
@@ -166,15 +207,15 @@ solve(int                                 phase,
     assert(mCount == p);}
     #endif
 
-    if (p == 0) {
-        printf("PLUS %d: nothing to do; converged in 0 iters.\n", phase);
-        return true;
-    }
 
     // This is reduced with each completed sliding interval. We will eventually
     // eliminate all of it except for entries corresponding to friction that
-    // remains Sliding throughout the impulse solution.
-    m_rhsLeft = rhs; // what's left to solve
+    // remains Sliding throughout the impulse solution. m_verrLeft represents
+    // the actual start-of-sliding-interval constraint-space velocity so is used
+    // to classify frictional contents.
+    m_verrLeft = verrStart; // what's left to solve TODO: get rid of this
+    Vector piELeft = piExpand; // TODO: and this
+    m_verrExpand.resize(m); m_verrExpand.setToZero();
 
     Vector piTotal(m, Real(0)), piGuess(m);
     Vector piSave, dpi; // temps
@@ -186,31 +227,44 @@ solve(int                                 phase,
     Real prevNormRMSenf = NaN;
 
     // Each sliding interval requires a complete restart, except that we 
-    // continue to accumulate piTotal. We're done when we take an interval of 
-    // length frac==1.
+    // continue to accumulate piTotal. We're done when we take a step interval 
+    // of  length s==1.
     int interval = 0;
-    Real frac = 0;
-    while (frac < 1) {
+    Real s = 0;
+    while (s < 1) {
         ++interval; 
         m_active = participating; m_mult2active.resize(m);
         fillMult2Active(m_active, m_mult2active);
 
+        // Calculate remaining expansion impulse part of RHS verrE=A*piE.
+        // This is how much we'll change verr if we get to apply the full
+        // expansion impulse in this sliding interval.
+        if (nx)
+            for (MultiplierIndex mx(0); mx < m; ++mx) {
+                m_verrExpand[mx] = 
+                    -(  multRowTimesSparseCol(A,mx,expanding,piELeft)
+                      + D[mx]*piELeft[mx]);
+            }
+
+        if (p == 0) {
+            SimTK_DEBUG1("PLUS %d: nothing to do; converged in 0 iters.\n", phase);
+            // Returning pi=0; can still have applied impulse or piExpand!=0 so 
+            // verr is updated.
+            if (hasAppliedImpulse) verrStart += verrApplied;
+            if (nx)                verrStart += m_verrExpand;
+            return true;
+        }
+
         #ifndef NDEBUG
-        printf("\n***** Interval %d start\n", interval);
+        printf("\n***** Sliding interval %d start\n", interval);
         cout << "  active=" << m_active << endl;
         cout << "  mult2active=" << m_mult2active << endl;
         cout << "  piTotal=" << piTotal << endl;
-        cout << "  rhsLeft=" << m_rhsLeft << endl;
-        printf( "  known: ");
-        int nKnowns=0;
-        for (unsigned uc=0; uc < uniContact.size(); ++uc) {
-            const UniContactRT& rt = uniContact[uc];
-            if (rt.m_type != Known) continue;
-            nKnowns++;
-            printf(" %d:%g", (int)uc, rt.m_knownPi);
-        }
-        if (!nKnowns) printf(" NONE");
-        printf("\n");
+        cout << "  verrLeft=" << m_verrLeft << endl;
+        cout << "  verrApplied=" << verrApplied << endl;
+        cout << "  expanding=" << expanding << endl;
+        cout << "  piELeft=" << piELeft << endl;
+        cout << "  verrExpand=" << m_verrExpand << endl;
         #endif
 
         piGuess = 0; // Hold the best-guess impulse for this interval.
@@ -241,14 +295,16 @@ solve(int                                 phase,
 
             m_mult2active.resize(m);
             fillMult2Active(m_active, m_mult2active);
-            initializeNewton(A, piGuess, uniContact);
-            updateDirectionsAndCalcCurrentError(A, uniContact,
+            initializeNewton(A, piGuess, verrApplied, uniContact);
+            updateDirectionsAndCalcCurrentError(A, uniContact, 
+                                                piELeft, verrApplied,
                                                 m_piActive,m_errActive);
             
             if (m_active.empty())
                 break;
           
-            updateJacobianForSliding(A, uniContact);
+            updateJacobianForSliding(A, uniContact, piELeft, verrApplied);
+            Real prevNorm = NaN;
             Real errNorm = m_errActive.norm();
             int newtIter = 0;
             SimTK_DEBUG1(">>>> Start NEWTON solve with errNorm=%g...\n", errNorm);
@@ -257,53 +313,73 @@ solve(int                                 phase,
                 // Solve for deltaPi.
                 FactorQTZ fac(m_JacActive);
                 fac.solve(m_errActive, dpi);
+                const Real deltaNorm = dpi.norm();
 
                 #ifndef NDEBUG
-                printf("> NEWTON iter %d begin, errNorm=%g\n", newtIter, errNorm);
+                printf("> NEWTON iter %d: errNorm=%g(v) -> deltaNorm=%g(pi)\n", 
+                       newtIter, errNorm, dpi.norm());
+                //cout << "> JacActive=" << m_JacActive;
                 cout << "> piActive=" << m_piActive << endl;
                 cout << "> errActive=" << m_errActive << endl;
                 cout << "> deltaPi=" << dpi << endl;
                 #endif
 
                 // Backtracking line search.
-                const Real MinFrac = 0.01; // take at least this much
+                const Real MinBack = 0.01; //don't shrink step below this factor
                 const Real SearchReduceFac = 0.5;
                 
-                Real frac = 1;
+                Real back = 1;
                 int nsearch = 0;
                 piSave = m_piActive;
+                prevNorm = errNorm;
                 while (true) {
                     ++nsearch;
-                    SimTK_DEBUG2("Line search iter %d with frac=%g.\n", 
-                                 nsearch, frac);
-                    m_piActive = piSave - frac*dpi;
+                    SimTK_DEBUG3("Line search iter %d: back=%g, prevNorm=%g.\n", 
+                                 nsearch, back, prevNorm);
+                    m_piActive = piSave - back*dpi;
 
-                    updateDirectionsAndCalcCurrentError(A,uniContact,m_piActive,
-                                                        m_errActive);
-                    Real normNow = m_errActive.norm();
+                    updateDirectionsAndCalcCurrentError(A,uniContact,
+                                                        piELeft,verrApplied,
+                                                        m_piActive,m_errActive);
+                    errNorm = m_errActive.norm();
                     #ifndef NDEBUG
                     cout << "> piNow=" << m_piActive << endl;
                     cout << "> errNow=" << m_errActive
-                         << " normNow=" << normNow << endl;
+                         << " normNow=" << errNorm << endl;
                     #endif
-                    if (normNow < errNorm) {
-                        errNorm = normNow;
+                    if (errNorm < prevNorm)
                         break;
-                    }
 
-                    frac *= SearchReduceFac;
-                    if (frac*SearchReduceFac < MinFrac) {
-                        SimTK_DEBUG2("LINE SEARCH STUCK at iter %d: accepting "
-                            "small norm increase at frac=%g\n", nsearch,frac);
-                        errNorm = normNow;
+                    if (back <= MinBack) {
+                        SimTK_DEBUG3("LINE SEARCH STUCK at iter %d: accepting "
+                            "small norm increase %g at back=%g\n", nsearch,
+                            errNorm - prevNorm, back);
                         break;
                     }
-                    SimTK_DEBUG2("GOT WORSE @iter %d: backtrack to frac=%g\n", 
-                           nsearch, frac);
+                    back *= SearchReduceFac;
+                    SimTK_DEBUG2("GOT WORSE @iter %d: backtrack to back=%g\n", 
+                           nsearch, back);
                 }
+
+                SimTK_DEBUG2("Improvement rate now/prev at iter %d is %g\n",
+                                newtIter, errNorm / prevNorm);
 
                 if (errNorm < m_convergenceTol)
                     break; // we have a winner
+
+                // If we're not making sufficient progress after 3 steps,
+                // we have likely converged to a local minimum and the problem 
+                // is infeasible. Here we're arbitrarily saying that if we
+                // can't even improve 5%, we'll just give up.
+                // TODO: this is probably too crude and might drop out too early
+                //       at times; also need to deal with this failure -- it 
+                //       may be a Painleve situation.
+                if (newtIter >= 3 && errNorm > 0.95*prevNorm) {
+                    SimTK_DEBUG2("PLUSImpulseSolver Newton: poor progress "
+                    "after %d iters; errNorm=%g (infeasible?).\n", 
+                    newtIter, errNorm);
+                    break; // converged, but not to zero
+                }
 
                 if (newtIter >= m_maxIters) {
                     SimTK_DEBUG2("PLUSImpulseSolver Newton failed to converge "
@@ -311,8 +387,10 @@ solve(int                                 phase,
                     break; // we have a loser
                 }
 
-                updateJacobianForSliding(A, uniContact);
+                updateJacobianForSliding(A, uniContact, piELeft, verrApplied);
+                prevNorm = errNorm;
             }
+
             SimTK_DEBUG2("<<<< NEWTON done in %d iters; norm=%g.\n",
                          newtIter,errNorm);
 
@@ -348,12 +426,8 @@ solve(int                                 phase,
             for (int k=0; k < mUniCont; ++k) {
                 const UniContactRT&   rt = uniContact[k];
                 const MultiplierIndex mx = rt.m_Nk;
-                if (rt.m_contactCond == UniOff) {
+                if (rt.m_contactCond==UniOff || rt.m_contactCond==UniKnown) {
                     piGuess[mx] = 0;
-                    continue;
-                }
-                if (rt.m_contactCond == UniKnown) {
-                    piGuess[mx] = rt.m_knownPi;
                     continue;
                 }
 
@@ -363,9 +437,10 @@ solve(int                                 phase,
                 assert(ax.isValid());
                 // Only the in-bounds value gets saved in piGuess in case we
                 // need to use it for an initial guess on the next iteration.
-                piGuess[mx] = rt.m_sign*m_piActive[ax] < 0 ? m_piActive[ax] 
-                                                           : Real(0);
-                const Real err=std::abs(m_piActive[ax] - piGuess[mx]);
+                const Real piAdj = rt.m_sign*m_piActive[ax] < 0 ? m_piActive[ax] 
+                                                                : Real(0);
+                piGuess[mx] = piAdj; 
+                const Real err=std::abs(m_piActive[ax] - piAdj);
                 if (err>worstUniNormalValue) 
                     worstUniNormal=k, worstUniNormalValue=err;
             }
@@ -399,7 +474,7 @@ solve(int                                 phase,
 
                     // "Sucking" normal forces are zero already in piGuess,
                     // and known normal force has been inserted if needed.
-                    nmag = std::abs(piGuess[Nk]); 
+                    nmag = std::abs(piGuess[Nk] + piELeft[Nk]); 
                     if (tmag > mu*nmag) {
                         scale = mu*nmag/tmag;
                         const Real err = tmag - mu*nmag;
@@ -416,30 +491,7 @@ solve(int                                 phase,
                 }
             }
 
-            // LENGTH: a set of constraint equations forming a vector whose
-            // maximum length is limited.
-            //for (int k=0; k < mLength; ++k) {
-            //    LengthLimited& len = lengthLimited[k];
-            //    const Array_<int>& rows = len.m_components;
-            //    Vec3 rowSums(0);
-            //    for (int c=0; c < p; ++c) {
-            //        const int cx = participating[c];
-            //        for (unsigned i=0; i<rows.size(); ++i)
-            //            rowSums[i] += A(rows[i],cx)*pi[cx];
-            //    }
-            //    Real localEr2 = 0;
-            //    for (unsigned i=0; i<rows.size(); ++i) {
-            //        const int rx = rows[i];
-            //        const Real er = b[rx]-rowSums[i];
-            //        if (A(rx,rx) != Real(0))
-            //            pi[rx] += sor * er/A(rx,rx);
-            //        localEr2 += square(er);
-            //    }
-            //    sum2all += localEr2;
-            //    if (!(len.m_hitLimit=boundVector(len.m_maxLength, rows, pi)))
-            //        sum2enf += localEr2;
-            //}
-
+            // TODO: uni speed, constraint- and state-limited friction.
 
             if (   worstBoundedValue<=SignificantReal
                 && worstUniNormalValue<=SignificantReal
@@ -510,20 +562,25 @@ solve(int                                 phase,
             }
         } 
 
-        // Need to check what fraction of this interval we can accept. We are
+        // Need to check what fraction s of this interval we can accept. We are
         // only limited by frictional contacts that are currently Sliding;
         // Rolling and Impending-slip contacts don't restrict the interval.
-        frac = 1;
+        s = 1;
         for (int k=0; k < mUniCont; ++k) {
             const UniContactRT& rt = uniContact[k];
-            if (rt.m_frictionCond != Sliding)
+            if (rt.m_contactCond==UniOff || rt.m_frictionCond != Sliding)
                 continue;
             const Array_<MultiplierIndex>& Fk = rt.m_Fk;
             const MultiplierIndex          Nk = rt.m_Nk;
             assert(Fk.size()==2); //TODO: generalize
-            Vec2 db(multRowTimesActiveCol(A,Fk[0],m_active,m_piActive),
-                    multRowTimesActiveCol(A,Fk[1],m_active,m_piActive));
-            Vec2 bend = rt.m_slipVel - db;
+            // Velocity change db=[Ax Ay]*(pi+piE). TODO: D?
+            Vec2 db(  multRowTimesActiveCol(A,Fk[0],m_active,m_piActive)
+                    - m_verrExpand[Fk[0]],
+                      multRowTimesActiveCol(A,Fk[1],m_active,m_piActive)
+                    - m_verrExpand[Fk[1]]);
+            Vec2 bend(rt.m_slipVel - db);
+            if (hasAppliedImpulse)
+                bend += Vec2(verrApplied[Fk[0]],verrApplied[Fk[1]]);
             #ifndef NDEBUG
             cout << "slipVel " << k << " from " << rt.m_slipVel 
                  << " to " << bend << endl;
@@ -534,64 +591,113 @@ solve(int                                 phase,
                 "Sliding; slip speed %g too small (Rolling at %g).",
                 rt.m_slipMag, m_maxRollingTangVel);
 
+            // See if we got lucky and sliding force slowed contact to below
+            // the rolling speed threshold (this is rare; reversal is much more
+            // common). Although not strictly necessary, we'll attempt to stop 
+            // the step where it came closest to zero velocity to make the
+            // smoothest sliding->rolling transition possible.
             if (bendMag <= m_maxRollingTangVel) {
-                SimTK_DEBUG2("Friction %d slowed to a halt, v=%g\n", k, bendMag);
+                SimTK_DEBUG3("Sliding contact %d slowed to rolling speed: "
+                             "v=%g, vTrans=%g\n", 
+                             k, bendMag, m_maxRollingTangVel);
+                if (bendMag < SignificantReal) {
+                    SimTK_DEBUG("  (Near dead stop -- accept the step as is.)\n");
+                    continue;
+                }
+                Vec2 newEndPt;
+                Real s1 = calcSlidingStepLengthToOrigin(rt.m_slipVel,bend,
+                                                        newEndPt);
+                SimTK_DEBUG2("  (Will use step=%g where speed was %g.)\n",
+                             s1, newEndPt.norm());
+                s = std::min(s, s1);
                 continue;
             }
+
+            // Still sliding; check change in direction from initial to final
+            // sliding velocity.
             const Real cosTheta = 
                 clamp(-1, dot(rt.m_slipVel,bend)/(rt.m_slipMag*bendMag), 1);
+
+            // This is the normal case: still sliding in roughly the same
+            // direction. Take the whole step.
             if (cosTheta >= m_cosMaxSlidingDirChange) {
                 SimTK_DEBUG3("Friction %d rotated %g deg, less than max %g\n", 
                        k, std::acos(cosTheta)*180/Pi,
                        std::acos(m_cosMaxSlidingDirChange)*180/Pi);
-                continue;
+                continue; // s==1 for this contact
             }
+
+            // The sliding direction changed too much. It may have reversed 
+            // and passed through or near zero, in which case we step only to
+            // the closest-to-zero point. Otherwise we'll reduce the step 
+            // until the sliding direction change is within bounds.
+
             SimTK_DEBUG4("TOO BIG: Sliding fric %d; endmag=%g, rot=%g deg > %g\n", 
                    k, bendMag, std::acos(cosTheta)*180/Pi,
                    std::acos(m_cosMaxSlidingDirChange)*180/Pi);
 
             Vec2 endPt;
-            Real frac1 = calcSlidingStepLengthToOrigin(rt.m_slipVel,bend,endPt);
-            const Real endPtMag = endPt.norm();
-            if (endPtMag <= m_maxRollingTangVel) {
-                SimTK_DEBUG2("  Frac=%g halts it, v=%g\n", frac1, endPtMag);
-                frac = std::min(frac, frac1);
+            Real s1 = calcSlidingStepLengthToOrigin(rt.m_slipVel,bend,endPt);
+            const Real endPtMagSq = endPt.normSqr();
+            if (endPtMagSq <= square(m_maxRollingTangVel)) {
+                SimTK_DEBUG2("  Frac=%g halts it, v=%g\n", s1, 
+                             std::sqrt(endPtMagSq));
+                s = std::min(s, s1);
                 continue;
             }
-            Real frac2 = calcSlidingStepLengthToMaxChange(rt.m_slipVel,bend);
+
+            // Substantial direction change without passing near zero.
+            // Just take part of the step to keep the change manageable.
+            Real s2 = calcSlidingStepLengthToMaxChange(rt.m_slipVel,bend);
             SimTK_DEBUG2("  Frac=%g reduces angle to %g degrees.\n", 
-                   frac2, std::acos(m_cosMaxSlidingDirChange)*180/Pi);
-            frac = std::min(frac, frac2);
+                   s2, std::acos(m_cosMaxSlidingDirChange)*180/Pi);
+            s = std::min(s, s2);
         }
 
-        if (frac < 1) m_piActive *= frac;
+        // If we're taking very close to the whole step, we would be left with
+        // a tiny sliver of a step that might cause numerical difficulties (and
+        // will be expensive). In that case just take the whole thing.
+        if (s > MaxPartialSlidingStepLength)
+            s = 1;
+
+        for (unsigned i=0; i < expanding.size(); ++i) {
+            const MultiplierIndex mx = expanding[i];
+            const Real sPiE = s*piELeft[mx];
+            piELeft[mx] -= sPiE; // How much piE left to do
+        }
+        m_piActive *= s;
         addInActiveCol(m_active, m_piActive, piTotal); // accumulate in piTotal
 
-        // TODO: Update rhs. Won't be used when alpha=1; this is just so we can
-        // print it during development.
-        for (ActiveIndex ax(0); ax < m_active.size(); ++ax) {
-            const MultiplierIndex mx = m_active[ax];
-            m_rhsLeft[mx] -= multRowTimesActiveCol(A,mx,m_active,m_piActive);
+        // Update rhs. TODO: D*piActive
+        for (MultiplierIndex mx(0); mx < m; ++mx) {
+            m_verrLeft[mx] -= multRowTimesActiveCol(A,mx,m_active,m_piActive)
+                              - s*m_verrExpand[mx];
+        }
+        if (hasAppliedImpulse) {
+            m_verrLeft  += s*verrApplied;
+            verrApplied -= s*verrApplied;
         }
 
         #ifndef NDEBUG
-        printf("SP interval %d end: frac=%g\n", interval, frac);
+        printf("SP interval %d end: s=%g\n", interval, s);
         cout << ": m_piActive=" << m_piActive << endl;
-        cout << ": m_rhsLeft=" << m_rhsLeft << endl;
+        cout << ": m_verrLeft=" << m_verrLeft << endl;
+        cout << ": verrAppliedLeft=" << verrApplied << endl;
+        cout << ": piELeft=" << piELeft << endl;
         #endif
     }
 
     // Return the result. TODO: don't copy 
-    pi = piTotal;
+    pi = piTotal; // doesn't include piE
+    verrStart = m_verrLeft;
 
     // Check how we did on the original problem.
     SimTK_DEBUG("SP DONE. Check normal complementarity ...\n");
-    Vector res = rhs-A*pi;
     for (unsigned k=0; k < uniContact.size(); ++k) {
         const UniContactRT& rt = uniContact[k];
         const MultiplierIndex mx = rt.m_Nk;
         SimTK_DEBUG4("%d: pi=%g verr=%g pi*v=%g\n", k, 
-                     pi[mx], res[mx], pi[mx]*res[mx]);
+                     pi[mx], verrStart[mx], pi[mx]*verrStart[mx]);
     } 
     //TODO: printf("SP DONE. Check friction cones ...\n");
 
@@ -602,7 +708,89 @@ solve(int                                 phase,
     return converged;
 }
 
+//------------------------------------------------------------------------------
+//                           SOLVE BILATERAL
+//------------------------------------------------------------------------------
+bool PLUSImpulseSolver::
+solveBilateral
+   (const Array_<MultiplierIndex>&  participating, // p<=m of these 
+    const Matrix&                   A,     // m X m, symmetric
+    const Vector&                   D,     // m, diag>=0 added to A
+    const Vector&                   rhs,   // m, RHS
+    Vector&                         pi     // m, unknown result
+    ) const
+{
+    SimTK_DEBUG("--------------------------------\n");
+    SimTK_DEBUG(  "PLUS BILATERAL SOLVER:\n");
+    ++m_nBilateralSolves;
 
+    const int m=A.nrow(); 
+    const int p = (int)participating.size();
+
+    assert(A.ncol()==m); 
+    assert(D.size()==0 || D.size()==m);
+    assert(rhs.size()==m);
+    assert(p<=m);
+ 
+    pi.resize(m);
+    pi.setToZero(); // That takes care of all non-participators.
+
+    if (p == 0) {
+        SimTK_DEBUG("  no bilateral participators. Nothing to do.\n");
+        SimTK_DEBUG("--------------------------------\n");
+        return true;
+    }
+
+    m_nBilateralIters++; // Just one "iteration".
+
+    // Set up the smaller problem containing only the participating constraints:
+    //   bilateralActive = P*A*~P
+    //   rhsActive       = P*rhs
+    //   piActive = a place to put the result for just the active part
+    m_bilateralActive.resize(p,p);
+    m_rhsActive.resize(p); m_piActive.resize(p);
+    const bool hasD = (D.size() > 0);
+    for (ActiveIndex aj(0); aj < p; ++aj) {
+        const MultiplierIndex mj = participating[aj];
+        for (ActiveIndex ai(0); ai < p; ++ai) {
+            const MultiplierIndex mi = participating[ai];
+            m_bilateralActive(ai,aj) = A(mi,mj);
+        }
+        if (hasD)
+            m_bilateralActive(aj,aj) += D[mj];
+        m_rhsActive[aj] = rhs[mj];
+    }
+
+    // Calculate the pseudoinverse of P*A*~P, and then solve to get
+    //     piActive = pinv(P*A*~P) * rhsActive
+    FactorQTZ pinv(m_bilateralActive);
+    pinv.solve(m_rhsActive, m_piActive);
+    // Distribute the active result into the full impulse vector.
+    for (ActiveIndex ai(0); ai < p; ++ai) {
+        const MultiplierIndex mi = participating[ai];
+        pi[mi] = m_piActive[ai];
+    }
+
+    #ifndef NDEBUG
+    cout << "A=" << A;
+    cout << "D=" << D << endl;
+    cout << "rcond(A+D)=" << pinv.getRCondEstimate() 
+         << " rank=" << pinv.getRank() << endl;
+    cout << "rhs=" << rhs << endl;
+    cout << "active=" << participating << endl;
+    cout << "-> piActive=" << m_piActive << endl;
+    cout << "-> pi=" << pi << endl;
+    cout << "resid active=" << m_bilateralActive*m_piActive-m_rhsActive << endl;
+    if (D.size()) cout << "resid=" << A*pi+D.elementwiseMultiply(pi)-rhs << endl;
+    else cout << "resid=" << A*pi-rhs << endl;
+    #endif
+    SimTK_DEBUG("--------------------------------\n");
+    return true;
+}
+
+//------------------------------------------------------------------------------
+//              CALC SLIDING STEP LENGTH TO ORIGIN (Vec2 and Vec3)
+//------------------------------------------------------------------------------
 Real PLUSImpulseSolver::
 calcSlidingStepLengthToOrigin(const Vec2& A, const Vec2& B, Vec2& Q) const
 {
@@ -667,6 +855,10 @@ calcSlidingStepLengthToOrigin(const Vec3& A, const Vec3& B, Vec3& Q) const
     return stepLength;
 }
 
+
+//------------------------------------------------------------------------------
+//            CALC SLIDING STEP LENGTH TO MAX CHANGE (Vec2 and Vec3)
+//------------------------------------------------------------------------------
 Real PLUSImpulseSolver::
 calcSlidingStepLengthToMaxChange(const Vec2& A, const Vec2& B) const
 {
@@ -752,15 +944,17 @@ calcSlidingStepLengthToMaxChange(const Vec3& A, const Vec3& B) const
     return sol;
 }
 
-// At the start of each sliding interval, classify all frictional contacts.
+//------------------------------------------------------------------------------
+//                           CLASSIFY FRICTIONALS
+//------------------------------------------------------------------------------
+// At the start of each sliding interval, classify all frictional contacts
+// based on the actual start-of-interval constraint-space velocity.
 // For unilateral contact friction, if the unilateral normal contact is 
 // Observing (passive) then its friction constraints are off also. Otherwise
-// (normal is Participating or Known),
-// every frictional contact is classified as Rolling or Sliding depending on 
-// the current slip velocity as present
-// in the remaining right hand side of the rolling equations in A. No frictional
-// contact is marked Impending at the start of a sliding interval; that only
-// occurs as a result of a transition from Rolling.
+// (normal is Participating or Known), every frictional contact is classified 
+// as Rolling or Sliding depending on the current slip velocity as present
+// in m_verrLeft. No frictional contact is marked Impending at the start of a 
+// sliding interval; that only occurs as a result of a transition from Rolling.
 void PLUSImpulseSolver::
 classifyFrictionals(Array_<UniContactRT>& uniContact) const {
     SimTK_DEBUG1("classifyFrictionals(): %d uni contacts\n", 
@@ -784,8 +978,8 @@ classifyFrictionals(Array_<UniContactRT>& uniContact) const {
             Real tmag=0;
             for (unsigned i=0; i<Fk.size(); ++i) {
                 const MultiplierIndex mx = Fk[i];
-                rt.m_slipVel[i] = m_rhsLeft[mx];
-                tmag += square(m_rhsLeft[mx]);
+                rt.m_slipVel[i] = m_verrLeft[mx];
+                tmag += square(m_verrLeft[mx]);
             }
             tmag = std::sqrt(tmag);
             rt.m_slipMag = tmag;
@@ -801,21 +995,103 @@ classifyFrictionals(Array_<UniContactRT>& uniContact) const {
     }
 }
 
+//------------------------------------------------------------------------------
+//                            FILL MULT 2 ACTIVE
+//------------------------------------------------------------------------------
+// mult2active must already have been resized to size of A
+void PLUSImpulseSolver::
+fillMult2Active(const Array_<MultiplierIndex,ActiveIndex>& active,
+                Array_<ActiveIndex,MultiplierIndex>& mult2active) const
+{
+    const int p = active.size();
+    mult2active.fill(ActiveIndex()); // invalid
+    for (ActiveIndex aj(0); aj < p; ++aj) {
+        const MultiplierIndex mj = active[aj];
+        mult2active[mj] = aj;
+    }
+    #ifndef NDEBUG
+    printf("fillMult2Active:\n");
+    cout << ": active=" << active << endl;
+    cout << ": mult2active=" << mult2active << endl;
+    #endif
+}
+
+//------------------------------------------------------------------------------
+//                             INITIALIZE NEWTON
+//------------------------------------------------------------------------------
+// Initialize for a Newton iteration. Fill in the part of the Jacobian
+// corresponding to linear equations since those won't change. Transfer
+// previous impulses pi to new piActive. Assumes m_active and m_mult2active
+// have been filled in.
+void PLUSImpulseSolver::
+initializeNewton(const Matrix&                  A, 
+                 const Vector&                  pi, // m of these 
+                 const Vector&                  verrApplied,
+                 const Array_<UniContactRT>&    uniContact) const { 
+    const int na = m_active.size();
+    const bool hasAppliedImpulse = (verrApplied.size() > 0);
+    m_JacActive.resize(na,na); m_rhsActive.resize(na); m_piActive.resize(na);
+    m_errActive.resize(na);
+    for (ActiveIndex aj(0); aj < na; ++aj) {
+        const MultiplierIndex mj = m_active[aj];
+        for (ActiveIndex ai(0); ai < na; ++ai) {
+            const MultiplierIndex mi = m_active[ai];
+            m_JacActive(ai,aj) = A(mi,mj);
+        }
+        m_rhsActive[aj] = m_verrLeft[mj] + m_verrExpand[mj];
+        if (hasAppliedImpulse) m_rhsActive[aj] += verrApplied[mj];
+        m_piActive[aj]  = pi[mj];
+    }
+    // For impacters, guess a small separating impulse. This improves
+    // convergence because it puts the max() terms in the Jacobian on
+    // the right branch.
+    for (unsigned k=0; k < uniContact.size(); ++k) {
+        const UniContactRT& rt = uniContact[k];
+        if (rt.m_contactCond != UniActive)
+            continue;
+
+        const MultiplierIndex mz = rt.m_Nk;
+        const ActiveIndex az = m_mult2active[mz];
+        assert(az.isValid());
+        // Don't use rt.m_sign here because it affects both pi & rhs; we just
+        // want the signs to match.
+        m_piActive[az] = .01*sign(m_rhsActive[az]); //-1,0,1
+        SimTK_DEBUG3("  active normal %d has v=%g; guess pi=%g\n",
+                    (int)az,m_rhsActive[az],m_piActive[az]);
+    }
+    #ifndef NDEBUG
+    printf("initializeNewton:\n");
+    cout << ": verrLeft was=" << m_verrLeft << endl;
+    cout << ": verrExpand was=" << m_verrExpand << endl;
+    cout << ": verrApplied was=" << verrApplied << endl;
+    cout << ": rhsActive=" << m_rhsActive << endl;
+    cout << ": pi was=" << pi << endl;
+    cout << ": piActive=" << m_piActive << endl;
+    #endif
+}
+
+//------------------------------------------------------------------------------
+//                  UPDATE DIRECTIONS AND CALC CURRENT ERROR
+//------------------------------------------------------------------------------
 // Calculate err(pi). For Impending slip frictional contacts we also revise
-// the slip direction based on the current value of pi.
+// the slip direction based on the current values of pi and piExpand.
 void PLUSImpulseSolver::
 updateDirectionsAndCalcCurrentError
-   (const Matrix& A, 
-    Array_<UniContactRT>& uniContact, const Vector& piActive,
+   (const Matrix& A,  Array_<UniContactRT>& uniContact, 
+    const Vector& piELeft, const Vector& verrAppliedLeft,
+    const Vector& piActive,
     Vector& errActive) const 
 {
     const int na = m_active.size();
     assert(piActive.size() == na);
     errActive.resize(na);
+
+    const bool hasAppliedImpulse = (verrAppliedLeft.size() > 0);
+
     // Initialize as though all rolling.
     for (ActiveIndex ai(0); ai < na; ++ai) {
         const MultiplierIndex mi = m_active[ai];
-        // err = A pi - rhs
+        // err = A pi - rhs (piExpand included in rhs)
         errActive[ai] = multRowTimesActiveCol(A,mi,m_active,piActive)
                         - m_rhsActive[ai];
     }
@@ -836,9 +1112,13 @@ updateDirectionsAndCalcCurrentError
         const MultiplierIndex mx=Fk[0], my=Fk[1], mz=Nk;
 
         if (rt.m_frictionCond==Impending) {
-            // Update slip direction to [Ax*pi Ay*pi].
-            Vec2 d(multRowTimesActiveCol(A,mx,m_active,piActive),
-                   multRowTimesActiveCol(A,my,m_active,piActive));
+            // Update slip direction to [Ax Ay]*(pi+piE) - verrApplied.
+            Vec2 d(multRowTimesActiveCol(A,mx,m_active,piActive)
+                   - m_verrExpand[mx],
+                   multRowTimesActiveCol(A,my,m_active,piActive)
+                   - m_verrExpand[my]);
+            if (hasAppliedImpulse)
+                d -= Vec2(verrAppliedLeft[mx],verrAppliedLeft[my]);
             const Real dnorm = d.norm();
             rt.m_slipVel = d; rt.m_slipMag = dnorm;
             SimTK_DEBUG3("Updated impending slipVel %d to %g,%g\n",k,d[0],d[1]);
@@ -849,104 +1129,56 @@ updateDirectionsAndCalcCurrentError
                           az=m_mult2active[mz];
         const Real pix = piActive[ax], piy=piActive[ay];
 
-        errActive[ax] = rt.m_slipMag*pix;
-        errActive[ay] = rt.m_slipMag*piy;
-        if (rt.m_contactCond == UniActive) { // normal is active
+        // Applying the sign here makes sure pizE is negative.
+        const Real pizE = rt.m_sign*piELeft[mz];
+
+        // The slipping or impending slip equation is
+        //     f = - mu N v/|v|
+        // where v is the slip velocity or impending slip velocity (above), and
+        // f is the tangential friction force vector, and N>=0 is the magnitude
+        // of the normal force. Our convention for multipliers is opposite
+        // applied forces, so we have
+        //    -pi_xy = - mu (-piz) v/|v|
+        // ==> pi_xy = - mu piz v/|v|
+        // ==> |v| pi_xy + mu piz v = 0
+        // We write the two error functions like this:
+        //     errx=|v|pi_x + mu*vx*[piE+min(pi_z,0)] 
+        //     erry=|v|pi_y + mu*vy*[piE+min(pi_z,0)] 
+
+        // Calculate the terms common to Active and Known contacts.
+        errActive[ax] = rt.m_slipMag*pix + mu*rt.m_slipVel[0]*pizE;
+        errActive[ay] = rt.m_slipMag*piy + mu*rt.m_slipVel[1]*pizE;
+
+        // Add in the additional term for Active contacts.
+        if (rt.m_contactCond == UniActive) {
             const ActiveIndex az=m_mult2active[mz];
             assert(az.isValid());
-            const Real piz=piActive[az];
-            // errx=|v|pi_x + mu*vx*min(pi_z,0)   [erry similar]
-            // But we calculate the Jacobian as though the equation were:
-            // errx=|v|pi_x + mu*vx*softmin0(pi_z) 
+            // Applying the sign here makes piz negative if it represents a 
+            // valid "pushing" force.
+            const Real piz=rt.m_sign*piActive[az];
             const Real minz = std::min(piz, Real(0));
-            //const Real minz = softmin0(piz, m_minSmoothness);
-
             errActive[ax] += mu*rt.m_slipVel[0]*minz;
             errActive[ay] += mu*rt.m_slipVel[1]*minz;
-        } else { // normal is an expander (known)
-            assert(rt.m_contactCond == UniKnown);
-            // errx=|v|pi_x + mu*vx*N   [erry similar]
-            const Real N = rt.m_knownPi;
-            errActive[ax] += mu*rt.m_slipVel[0]*N;
-            errActive[ay] += mu*rt.m_slipVel[1]*N;
         }
     }
-    //cout << "updateDirectionsAndCalcCurrentError():" << endl;
-    //cout << ":    pi=" << piActive << endl;
-    //cout << ": ->err=" << errActive << endl;
 }
 
-// mult2active must already have been resized to size of A
-void PLUSImpulseSolver::
-fillMult2Active(const Array_<MultiplierIndex,ActiveIndex>& active,
-                Array_<ActiveIndex,MultiplierIndex>& mult2active) const
-{
-    const int p = active.size();
-    mult2active.fill(ActiveIndex()); // invalid
-    for (ActiveIndex aj(0); aj < p; ++aj) {
-        const MultiplierIndex mj = active[aj];
-        mult2active[mj] = aj;
-    }
-    #ifndef NDEBUG
-    printf("fillMult2Active:\n");
-    cout << ": active=" << active << endl;
-    cout << ": mult2active=" << mult2active << endl;
-    #endif
-}
 
-// Initialize for a Newton iteration. Fill in the part of the Jacobian
-// corresponding to linear equations since those won't change. Transfer
-// previous impulses pi to new piActive. Assumes m_active and m_mult2active
-// have been filled in.
-void PLUSImpulseSolver::
-initializeNewton(const Matrix& A, const Vector& pi, // m of these 
-                 const Array_<UniContactRT>& uniContact) const { 
-    const int na = m_active.size();
-    m_JacActive.resize(na,na); m_rhsActive.resize(na); m_piActive.resize(na);
-    m_errActive.resize(na);
-    for (ActiveIndex aj(0); aj < na; ++aj) {
-        const MultiplierIndex mj = m_active[aj];
-        for (ActiveIndex ai(0); ai < na; ++ai) {
-            const MultiplierIndex mi = m_active[ai];
-            m_JacActive(ai,aj) = A(mi,mj);
-        }
-        m_rhsActive[aj] = m_rhsLeft[mj];
-        m_piActive[aj]  = pi[mj];
-    }
-    // For impacters, guess a small separating impulse. This improves
-    // convergence because it puts the max() terms in the Jacobian on
-    // the right branch.
-    // TODO: should only do this for unilateral contacts, not general
-    // bounded constraints.
-    for (unsigned k=0; k < uniContact.size(); ++k) {
-        const UniContactRT& rt = uniContact[k];
-        if (rt.m_contactCond != UniActive)
-            continue;
-
-        const MultiplierIndex mx = rt.m_Nk;
-        const ActiveIndex ax = m_mult2active[mx];
-        assert(ax.isValid());
-        m_piActive[ax] = .01*sign(m_rhsLeft[mx]); //-1,0,1
-        SimTK_DEBUG3("  active normal %d has v=%g; guess pi=%g\n",
-                    (int)ax,m_rhsLeft[mx],m_piActive[ax]);
-    }
-    #ifndef NDEBUG
-    printf("initializeNewton:\n");
-    cout << ": rhsLeft was=" << m_rhsLeft << endl;
-    cout << ": rhsActive=" << m_rhsActive << endl;
-    cout << ": pi was=" << pi << endl;
-    cout << ": piActive=" << m_piActive << endl;
-    #endif
-
-}
-
-// Calculate Jacobian J= D err(pi) / D pi (see above for err(pi)). All rows
-// of J corresponding to linear equations have already been filled in since
-// they can't change during the iteration. Only sliding and impending friction
-// rows are potentially nonlinear.
+//------------------------------------------------------------------------------
+//                       UDPATE JACOBIAN FOR SLIDING
+//------------------------------------------------------------------------------
+// Calculate Jacobian 
+//      J= D err(pi) / D pi
+// See updateDirectionsAndCalcCurrentError() for err(pi). All rows of J 
+// corresponding to linear equations, including rolling constraints, have 
+// already been filled in since they can't change during the iteration. Only 
+// sliding and impending friction rows are potentially nonlinear and thus
+// subject to change during the Newton iterations.
 void PLUSImpulseSolver::
 updateJacobianForSliding(const Matrix& A,
-                         const Array_<UniContactRT>& uniContact) const {
+                         const Array_<UniContactRT>& uniContact,
+                         const Vector& piELeft,
+                         const Vector& verrAppliedLeft) const {
     int nPairsChanged = 0;
     for (unsigned k=0; k < uniContact.size(); ++k) {
         const UniContactRT& rt = uniContact[k];
@@ -975,27 +1207,31 @@ updateJacobianForSliding(const Matrix& A,
         if (rt.m_frictionCond==Impending) {
             // Calculate terms for derivative of norm(d) w.r.t. pi.
             const RowVectorView Ax = A[mx], Ay = A[my];
+            const MultiplierIndex mz = rt.m_Nk;
+            const Real pizE = rt.m_sign*piELeft[mz];
 
             if (rt.m_contactCond==UniActive) { // Impending normal is active
-                const MultiplierIndex mz = rt.m_Nk;
                 const ActiveIndex az=m_mult2active[mz];
                 assert(az.isValid());
-                const Real piz=m_piActive[az], Axz=Ax(mz), Ayz=Ay(mz);
+                const Real piz=rt.m_sign*m_piActive[az];
+                const Real Axz=Ax(mz), Ayz=Ay(mz);
                 const Real minz  = softmin0(piz, m_minSmoothness);
                 const Real dminz = dsoftmin0(piz, m_minSmoothness);
-                // errx=|d|pix + dx*mu*softmin0(piz)   [erry similar]
-                // d/dpix errx = s*pix^2   + mu*Axx*softmin0(piz) + |d|
-                // d/dpiz errx = s*piz*pix + mu*Axz*softmin0(piz)
+                // errx=|d|pix + dx*mu*(pizE+softmin0(piz))   [erry similar]
+                // d/dpii errx = s*pix + mu*Axi*(pizE+softmin0(piz)), i!=x,z
+                // d/dpix errx = s*pix + mu*Axx*(pizE+softmin0(piz)) + |d|
+                // d/dpiz errx = s*pix + mu*Axz*(pizE+softmin0(piz))
                 //                                       + mu*dx*dsoftmin0(piz)
-                // d/dpii errx = s*pii*pix + mu*Axi*softmin0(piz)
+                // where s = dot(d/|d|, [Axi Ayi]).
+
                 // Fill in generic terms for unrelated constraints (not x,y,z)
                 for (ActiveIndex ai(0); ai<m_active.size(); ++ai) {
                     const MultiplierIndex mi = m_active[ai];
                     const Real pii=m_piActive[ai];
                     const Real Axi=Ax(mi), Ayi=Ay(mi);
                     const Real s = ~dhat*Vec2(Axi,Ayi);
-                    m_JacActive(ax,ai) = s*pix + mu*Axi*minz;
-                    m_JacActive(ay,ai) = s*piy + mu*Ayi*minz;
+                    m_JacActive(ax,ai) = s*pix + mu*Axi*(pizE+minz);
+                    m_JacActive(ay,ai) = s*piy + mu*Ayi*(pizE+minz);
                 }
                 // Add additional terms for related rows.
                 m_JacActive(ax,ax) += dnorm;            // d errx / dx
@@ -1003,20 +1239,21 @@ updateJacobianForSliding(const Matrix& A,
                 m_JacActive(ax,az) += mu*d[0]*dminz;    // d errx / dz
                 m_JacActive(ay,az) += mu*d[1]*dminz;    // d erry / dz
 
-            } else { // Impending normal is an expander
+            } else { // Impending normal is an expander; piz is not variable
                 assert(rt.m_contactCond==UniKnown);
-                const Real N = rt.m_knownPi;
-                // errx=|d|pix + dx*mu*N   [erry similar]
-                // d/dpix errx = s*pix^2   + mu*Axx*N + |d|
-                // d/dpii errx = s*pii*pix + mu*Axi*N, for i != x
+                // errx=|d|pix + dx*mu*pizE   [erry similar]
+                // d/dpii errx = s*pix + mu*Axi*pizE, for i != x
+                // d/dpix errx = s*pix + mu*Axx*pizE + |d|
+                // where s = dot(d/|d|, [Axi Ayi]).
+
                 // Fill in generic terms for unrelated constraints (not x,y)
                 for (ActiveIndex ai(0); ai<m_active.size(); ++ai) {
                     const MultiplierIndex mi = m_active[ai];
                     const Real pii=m_piActive[ai];
                     const Real Axi=Ax(mi), Ayi=Ay(mi);
                     const Real s = ~dhat*Vec2(Axi,Ayi);
-                    m_JacActive(ax,ai) = s*pix + mu*Axi*N;
-                    m_JacActive(ay,ai) = s*piy + mu*Ayi*N;
+                    m_JacActive(ax,ai) = s*pix + mu*Axi*pizE;
+                    m_JacActive(ay,ai) = s*piy + mu*Ayi*pizE;
                 }
                 m_JacActive(ax,ax) += dnorm;
                 m_JacActive(ay,ay) += dnorm;
@@ -1028,9 +1265,9 @@ updateJacobianForSliding(const Matrix& A,
                 const ActiveIndex az=m_mult2active[rt.m_Nk];
                 assert(az.isValid());
                 const Real piz=m_piActive[az];
-                // errx=|v|pi_x + mu*vx*softmin0(piz)   [erry similar]
-                // d/dpi_x errx = |v|
-                // d/dpi_z errx = mu*vx*dsoftmin0(piz)
+                // errx=|d|pi_x + mu*dx*softmin0(piz)   [erry similar]
+                // d/dpi_x errx = |d|
+                // d/dpi_z errx = mu*dx*dsoftmin0(piz)
                 const Real dminz = dsoftmin0(piz, m_minSmoothness);
                 m_JacActive(ax,az) = mu*d[0]*dminz;
                 m_JacActive(ay,az) = mu*d[1]*dminz;
@@ -1044,7 +1281,6 @@ updateJacobianForSliding(const Matrix& A,
         //cout << m_JacActive;
     }
     // Calculate Jacobian numerically.
-    //TODO: TURN THIS OFF!!!
     Array_<UniContactRT> uniContactTmp = uniContact;
     Vector piActive = m_piActive;
     Vector errActive0, errActive1;
@@ -1052,14 +1288,19 @@ updateJacobianForSliding(const Matrix& A,
     for (int i=0; i < piActive.size(); ++i) {
         const Real save = piActive[i];
         piActive[i] = save - 1e-6;
-        updateDirectionsAndCalcCurrentError(A,uniContactTmp,piActive,errActive0);
+        updateDirectionsAndCalcCurrentError(A,uniContactTmp,
+                                            piELeft, verrAppliedLeft,
+                                            piActive,errActive0);
         piActive[i] = save + 1e-6;
-        updateDirectionsAndCalcCurrentError(A,uniContactTmp,piActive,errActive1);
+        updateDirectionsAndCalcCurrentError(A,uniContactTmp,
+                                            piELeft, verrAppliedLeft,
+                                            piActive,errActive1);
         numJac(i) = (errActive1-errActive0)/2e-6;
         piActive[i] = save;
     }
     //cout << "JacErr=" << m_JacActive-numJac;
     cout << "Jacobian num vs. analytic norm=" << (m_JacActive-numJac).norm() << endl;
+    //cout << "USING NUMERICAL JAC\n"; m_JacActive = numJac;
     #endif
 }
 

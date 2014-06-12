@@ -49,13 +49,15 @@ ENDIF()
 SET(SIMBODY_VERSION 
     "${SIMBODY_MAJOR_VERSION}.${SIMBODY_MINOR_VERSION}${PATCH_VERSION_STRING}" 
     CACHE STRING 
-    "This is the version that will be built (can't be changed here)." 
+    "This is the version that will be built (can't be changed in GUI)." 
     FORCE)
 
 SET(SIMBODY_SONAME_VERSION
     "${SIMBODY_MAJOR_VERSION}.${SIMBODY_MINOR_VERSION}"
     CACHE STRING
-    "Soname version to use when generating shared libs")
+    "Soname version; appended to names of shared libs
+    (can't be changed in GUI)."
+    FORCE)
 
 # This is the suffix if we're building and depending on versioned libraries.
 SET(VN "_${SIMBODY_VERSION}")
@@ -256,6 +258,24 @@ ELSE() # Windows
 
 ENDIF()
 
+# If CMAKE_INSTALL_PREFIX is /usr/local, then the LIBDIR should necessarily be
+# lib/. Sometimes (on Linux), LIBDIR is something like x86_64-linux-gnu. The
+# linker will search /usr/lib/x86_64-linux-gnu (this path is in
+# /etc/ld.so.conf.d), but it will NOT search /usr/local/lib/x86-64-linux-gnu.
+# HOWEVER, it WILL search /usr/local/lib. So that Linux users needn't modify
+# their LD_LIBRARY_PATH if installing to /usr/local, we force the LIBDIR to be
+# lib/.
+# Note: CMake 3.0 fixes this issue. When we move to CMake 3.0, we can
+# remove this if-statement. See issue #151.
+IF("${CMAKE_INSTALL_PREFIX}" STREQUAL "/usr/local" OR
+        "${CMAKE_INSTALL_PREFIX}" STREQUAL "/usr/local/")
+    # Overwrite both of these variables; we use both of them.
+    SET(CMAKE_INSTALL_LIBDIR "lib")
+    SET(CMAKE_INSTALL_FULL_LIBDIR
+        "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+ENDIF()
+
+
 IF(UNIX AND NOT CMAKE_BUILD_TYPE)
     SET(CMAKE_BUILD_TYPE Release CACHE STRING "Debug or Release build" 
         FORCE)
@@ -295,13 +315,13 @@ IF(${CMAKE_CXX_COMPILER_ID} MATCHES "GNU" OR
    ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
 
     # If using either of these compilers, provide the option of 
-    # compiling usin the c++11 standard.
+    # compiling using the c++11 standard.
     OPTION(SIMBODY_STANDARD_11
         "Compile using the c++11 standard instead of c++03, 
         if using GCC or Clang." ON)
 
     IF(${SIMBODY_STANDARD_11})
-        LIST(APPEND CMAKE_CXX_FLAGS " -std=c++11")
+        SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
     ENDIF()
 
     if (inst_set_to_use)
@@ -466,13 +486,17 @@ ENDIF (${CMAKE_GENERATOR} MATCHES "Visual Studio")
 # Intel MKL: mkl_intel_c_dll;mkl_sequential_dll;mkl_core_dll
 SET(BUILD_USING_OTHER_LAPACK "" CACHE STRING
  "If you have your own Lapack and Blas, put library basenames here, separated by semicolons. See LAPACK_BEING_USED to see what's actually being used.")
-
 if(WIN32)
-    SET(LAPACK_PLATFORM_DEFAULT liblapack;libblas)
+    set(LAPACK_PLATFORM_DEFAULT liblapack;libblas)
 else()
-    SET(LAPACK_PLATFORM_DEFAULT lapack;blas)
+    find_package(BLAS)
+    find_package(LAPACK)
+    if(BLAS_FOUND AND LAPACK_FOUND)
+        set(LAPACK_PLATFORM_DEFAULT ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES})
+    else()
+        message(WARNING "Could not find blas/lapack")
+    endif()
 endif()
-
 SET(LAPACK_BEING_USED ${LAPACK_PLATFORM_DEFAULT} CACHE STRING
     "Basename of the actual Lapack library we're depending on; can't change here; see variable BUILD_USING_OTHER_LAPACK." FORCE)
 

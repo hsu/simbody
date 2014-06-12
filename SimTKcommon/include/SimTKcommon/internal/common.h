@@ -237,21 +237,32 @@ extern "C" {
 #include <algorithm>
 
 /* Transition macros for C++11 support. VC10 and VC11 have partial support for
-C++11, early VC's do not. Currently we're assuming no support from gcc. */
+C++11, early VC's do not. If using gcc or Clang, we check for C++11 support. */
 #ifndef SWIG
-    #if _MSC_VER>=1700 /* VC11 or higher */
+    #if _MSC_VER>=1700 || (defined(__GNUG__) && __cplusplus>=201103L)
+        /* VC11 or higher, OR using gcc or Clang and using C++11 */
         #define OVERRIDE_11  override
         #define FINAL_11     final
     #elif _MSC_VER==1600 /* VC10 */
         #define OVERRIDE_11  override
         #define FINAL_11     sealed
-    #else /* gcc or earlier VC */
+    #else /* gcc or Clang without C++11, or earlier VC */
         #define OVERRIDE_11
         #define FINAL_11
     #endif
 #else /* Swigging */
     #define OVERRIDE_11
     #define FINAL_11
+#endif
+
+/* Be very careful with this macro -- don't use it unless you have measured
+a performance improvement. You can end up with serious code bloat if you 
+override the compiler's judgement about when to inline, and that can cause
+cache misses which ultimately reduce performance. */
+#ifdef _MSC_VER
+    #define SimTK_FORCE_INLINE __forceinline
+#else
+    #define SimTK_FORCE_INLINE __attribute__((always_inline))
 #endif
 
 
@@ -729,13 +740,20 @@ template <class T> struct NiceTypeName {
     static const char* name() {return typeid(T).name();}
 };
 
+} // namespace SimTK
+
 /** This specializes the name of a type to be exactly the text you use to
 specify it, rather than whatever ugly thing might result on different platforms
-from resolution of typedefs, default template arguments, etc. **/
-#define SimTK_NICETYPENAME_LITERAL(T)           \
-template <> struct NiceTypeName< T > {          \
-    static const char* name() { return #T; }    \
-};
+from resolution of typedefs, default template arguments, etc. Note that this
+macro generates a template specialization that must be done in the SimTK
+namespace; consequently it opens and closes namespace SimTK and must not
+be invoked if you already have that namespace open. **/
+#define SimTK_NICETYPENAME_LITERAL(T)               \
+namespace SimTK {                                   \
+    template <> struct NiceTypeName< T > {          \
+        static const char* name() { return #T; }    \
+    };                                              \
+}
 
 // Some types for which we'd like to see nice type names.
 SimTK_NICETYPENAME_LITERAL(bool);            
@@ -763,7 +781,6 @@ SimTK_NICETYPENAME_LITERAL(std::complex<long double>);
 SimTK_NICETYPENAME_LITERAL(SimTK::FalseType);
 SimTK_NICETYPENAME_LITERAL(SimTK::TrueType); 
 
-} // namespace SimTK
 
 #endif /* C++ stuff */
 

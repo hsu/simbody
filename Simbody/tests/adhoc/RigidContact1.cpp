@@ -62,7 +62,7 @@ public:
                           Array_< DecorativeGeometry >& geometry) OVERRIDE_11
     {
         const Vec3 Bo = m_body.getBodyOriginLocation(state);
-        const Vec3 p_GC = Bo + Vec3(0, 2, m_distance); // above and back
+        const Vec3 p_GC = Bo + Vec3(0, 8, m_distance); // above and back
         const Rotation R_GC(UnitVec3(0,1,0), YAxis,
                             p_GC-Bo, ZAxis);
         viz.setCameraTransform(Transform(R_GC,p_GC));
@@ -144,7 +144,7 @@ public:
     {
         m_matter = new SimbodyMatterSubsystem(*this);
         m_forces = new GeneralForceSubsystem(*this);
-        m_matter->setShowDefaultGeometry(false);
+        //m_matter->setShowDefaultGeometry(false);
     }
 
     virtual ~AugmentedMultibodySystem() 
@@ -152,6 +152,9 @@ public:
 
     virtual const MobilizedBody& getBodyToWatch() const
     {   return m_matter->getGround(); }
+
+    virtual void addRubberBandLines(Visualizer& viz) const {}
+    virtual Real getRuntime() const {return 20.;}
 
     virtual Real getWatchDistance() const {return 1.5;}
     virtual void calcInitialState(State& state) const = 0;
@@ -207,24 +210,27 @@ public:
         const int nLtdFrictions = matter.getNumStateLimitedFrictions();
 
         for (UnilateralContactIndex ux(0); ux < nUniContacts; ++ux) {
-        const UnilateralContact& contact = matter.getUnilateralContact(ux);
-        const Vec3 loc = contact.whereToDisplay(state);
-        if (contact.isEnabled(state)) {
-            geometry.push_back(DecorativeSphere(.1)
-                .setTransform(loc)
-                .setColor(Cyan).setOpacity(.5));
-            //contact.showContactForce(state, geometry);
-            String text;
-            if (!contact.hasFriction(state))
-                text = "-ENABLED";
-            geometry.push_back(DecorativeText(String((int)ux)+text)
-                .setColor(White).setScale(TextScale)
-                .setTransform(loc+Vec3(0,.04,0)));
-        } else {
-            geometry.push_back(DecorativeText(String((int)ux))
-                .setColor(White).setScale(TextScale)
-                .setTransform(loc+Vec3(0,.02,0)));
-        }
+            const UnilateralContact& contact = matter.getUnilateralContact(ux);
+            const Vec3 loc = contact.whereToDisplay(state);
+            if (contact.isEnabled(state)) {
+                MultiplierIndex mx = contact.getContactMultiplierIndex(state);
+                const Vector& mults=state.updMultipliers();//TODO: can't use get
+                Vec3 color = std::abs(mults[mx])<SignificantReal 
+                    ? Yellow : Cyan;
+                geometry.push_back(DecorativeSphere(.1)
+                    .setTransform(loc).setColor(color).setOpacity(.5));
+                //contact.showContactForce(state, geometry);
+                String text;
+                if (!contact.hasFriction(state))
+                    text = "-ENABLED";
+                geometry.push_back(DecorativeText(String((int)ux)+text)
+                    .setColor(White).setScale(TextScale)
+                    .setTransform(loc+Vec3(0,.04,0)));
+            } else {
+                geometry.push_back(DecorativeText(String((int)ux))
+                    .setColor(White).setScale(TextScale)
+                    .setTransform(loc+Vec3(0,.02,0)));
+            }
         }
 
         //for (unsigned i=0; i < m_ts.m_proximals.m_friction.size(); ++i) {
@@ -289,7 +295,7 @@ private:
     ContactTrackerSubsystem*     m_tracker;
     CompliantContactSubsystem*   m_contactForces;
 
-    static const int NBalls = 2;
+    static const int NBalls = 10;
 
     Force::Gravity          m_gravity;
     Force::GlobalDamper     m_damper;
@@ -307,10 +313,14 @@ public:
 
     void calcInitialState(State& state) const OVERRIDE_11;
 
-    const MobilizedBody& getBodyToWatch() const OVERRIDE_11 {return m_pencil;}
-    Real getWatchDistance() const OVERRIDE_11 {return 20.;}
+    const MobilizedBody& getBodyToWatch() const OVERRIDE_11
+    {   static const MobilizedBody none; return none; }
+    Real getWatchDistance() const OVERRIDE_11 {return 30.;}
+    void addRubberBandLines(Visualizer& viz) const OVERRIDE_11;
+    Real getRuntime() const OVERRIDE_11 {return 75.;}
 
     const MobilizedBody::Planar& getPencil() const {return m_pencil;}
+    const MobilizedBody::Free& getBall() const {return m_ball;}
 
 private:
     // Add subsystems for compliant contact. TODO: shouldn't need pointers
@@ -320,6 +330,38 @@ private:
     Force::Gravity          m_gravity;
     Force::GlobalDamper     m_damper;
     MobilizedBody::Planar   m_pencil;
+    MobilizedBody::Pin      m_flapper;
+    MobilizedBody::Free     m_ball;
+
+    Vec3                    m_pencilSphereCenter;
+};
+
+
+//==============================================================================
+//                                  BLOCK
+//==============================================================================
+// This just a single block sitting on the ground with an off-center external
+// force.
+class Block : public AugmentedMultibodySystem {
+public:
+    Block();
+    ~Block() {}
+
+    void calcInitialState(State& state) const OVERRIDE_11;
+    const MobilizedBody& getBodyToWatch() const OVERRIDE_11
+    {   return m_block; }
+
+    Real getWatchDistance() const OVERRIDE_11 
+    {   return 8; }
+
+    const MobilizedBody::Free& getBlock() const {return m_block;}
+
+private:
+    Force::Gravity          m_gravity;
+    Force::GlobalDamper     m_damper;
+    MobilizedBody::Free     m_block;
+    MobilizedBody::Pin      m_link2;
+    MobilizedBody::Pin      m_link3;
 };
 
 //==============================================================================
@@ -334,18 +376,17 @@ int main(int argc, char** argv) {
         const Real Accuracy = 1e-2;
     #endif
 
-    const bool UseNewton = false; // default is Poisson restitution
-
-
   try { // If anything goes wrong, an exception will be thrown.
 
     // Create the augmented multibody model.
-    TimsBox mbs;
+    //TimsBox mbs;
     //BouncingBalls mbs;
-    //Pencil mbs;
+    Pencil mbs;
+    //Block mbs;
 
     SemiExplicitEulerTimeStepper sxe(mbs);
     sxe.setDefaultImpactCaptureVelocity(mbs.getCaptureVelocity());
+    sxe.setDefaultImpactMinCORVelocity(mbs.getCaptureVelocity()); //TODO
     sxe.setDefaultFrictionTransitionVelocity(mbs.getTransitionVelocity());
 
     const SimbodyMatterSubsystem&    matter = mbs.getMatterSubsystem();
@@ -355,6 +396,7 @@ int main(int argc, char** argv) {
     viz.setShowFrameNumber(true);
     viz.setShowFrameRate(true);
     viz.addDecorationGenerator(new ShowContact(sxe));
+    mbs.addRubberBandLines(viz);
 
     if (!mbs.getBodyToWatch().isEmptyHandle())
         viz.addFrameController(new BodyWatcher(mbs.getBodyToWatch(),
@@ -369,22 +411,39 @@ int main(int argc, char** argv) {
     getchar();
 
     const Real ConsTol = .001;
-    const Real PGSConvergenceTol = 1e-5;
-    const int  PGSMaxIters = 100;
-    const Real PGSSor = 1.0/*0.95*/; // successive over relaxation, 0..2, 1 is neutral
 
-    if (UseNewton)
-        sxe.setRestitutionModel(SemiExplicitEulerTimeStepper::Newton);
+    sxe.setRestitutionModel(SemiExplicitEulerTimeStepper::Poisson);
+    //sxe.setRestitutionModel(SemiExplicitEulerTimeStepper::Newton);
+    //sxe.setRestitutionModel(SemiExplicitEulerTimeStepper::NoRestitution);
+
+    sxe.setPositionProjectionMethod(SemiExplicitEulerTimeStepper::Bilateral);
+    //sxe.setPositionProjectionMethod(SemiExplicitEulerTimeStepper::Unilateral);
+    //sxe.setPositionProjectionMethod(SemiExplicitEulerTimeStepper::NoPositionProjection);
+
     sxe.setAccuracy(Accuracy); // integration accuracy
-    sxe.setConstraintTol(ConsTol);
+    sxe.setConstraintTolerance(ConsTol);
 
-    //pgs.setPGSConvergenceTol(PGSConvergenceTol);
-    //pgs.setPGSMaxIters(PGSMaxIters);
-    //pgs.setPGSSOR(PGSSor);
+    //sxe.setImpulseSolverType(SemiExplicitEulerTimeStepper::PGS);
+    sxe.setImpulseSolverType(SemiExplicitEulerTimeStepper::PLUS);
+
+    sxe.setInducedImpactModel(SemiExplicitEulerTimeStepper::Simultaneous);
+    //sxe.setInducedImpactModel(SemiExplicitEulerTimeStepper::Sequential);
+    //sxe.setInducedImpactModel(SemiExplicitEulerTimeStepper::Mixed);
+
+    sxe.setMaxInducedImpactsPerStep(1000);
+    //sxe.setMaxInducedImpactsPerStep(2);
+
+    printf("RestitutionModel: %s, InducedImpactModel: %s (maxIts=%d)\n",
+        sxe.getRestitutionModelName(sxe.getRestitutionModel()),
+        sxe.getInducedImpactModelName(sxe.getInducedImpactModel()),
+        sxe.getMaxInducedImpactsPerStep());
+    printf("PositionProjectionMethod: %s, ImpulseSolverType=%s\n",
+        sxe.getPositionProjectionMethodName(sxe.getPositionProjectionMethod()),
+        sxe.getImpulseSolverTypeName(sxe.getImpulseSolverType()));
+
 
     sxe.initialize(s);
     mbs.resetAllCountersToZero();
-    // mbs.updUnis().initialize(); // reinitialize
         
     Array_<State> states; states.reserve(10000);
 
@@ -393,26 +452,32 @@ int main(int argc, char** argv) {
     const double startReal = realTime();
     const double startCPU = cpuTime();
 
-    const Real h = .0055/5.5;
-    const int SaveEvery = 6*5.5; // save every nth step ~= 33ms
+    const Real h = .001;
+    const int SaveEvery = 33; // save every nth step ~= 33ms
 
+    Vector_<SpatialVec> reactions;
     do {
         const State& sxeState = sxe.getState();
         if ((nSteps%SaveEvery)==0) {
             #ifdef ANIMATE
             viz.report(sxeState);
-            #ifndef NDEBUG
-            printf("\nWAITING:"); getchar();
-            #endif
+            //cout << "\n********** t=" << sxe.getTime();
+            //cout << " u=" << sxeState.getU()[3] <<"\n\n";
+            //#ifndef NDEBUG
+            //printf("\nWAITING:"); getchar();
+            //#endif
             #endif
             states.push_back(sxeState);
         }
 
-        //pgs.stepToOLD(pgsState.getTime() + h);
         sxe.stepTo(sxeState.getTime() + h);
 
+        //printf("Reaction forces:\n");
+        //matter.calcMobilizerReactionForces(sxeState, reactions);
+        //cout << reactions << endl;
+
         ++nSteps;
-    } while (sxe.getTime() < RunTime);
+    } while (sxe.getTime() < mbs.getRuntime());
     // TODO: did you lose the last step?
 
 
@@ -426,7 +491,7 @@ int main(int argc, char** argv) {
     printf("Used SXETimeStepper (%s) at acc=%g consTol=%g\n", 
            sxe.getRestitutionModel()==SemiExplicitEulerTimeStepper::Newton 
             ? "Newton" : "Poisson",
-           sxe.getAccuracy(), sxe.getConstraintTol());
+           sxe.getAccuracyInUse(), sxe.getConstraintToleranceInUse());
 
     //       pgs.getPGSConvergenceTol(), pgs.getPGSMaxIters(),
     //       pgs.getPGSSOR());
@@ -503,12 +568,12 @@ TimsBox::TimsBox() {
     #else
         const Real RunTime=20;
         const Real Stiffness = 1e6;
-        const Real CoefRest = 0.3; 
+        const Real CoefRest = 0.4; 
         const Real TargetVelocity = 3; // speed at which to match coef rest
 //        const Real Dissipation = (1-CoefRest)/TargetVelocity;
         const Real Dissipation = 0.1;
-        const Real mu_d = .5;
-        const Real mu_s = 1.0;
+        const Real mu_d = .4;
+        const Real mu_s = .8;
         const Real mu_v = 0*0.1;
         const Real CaptureVelocity = 0.01;
         const Real TransitionVelocity = 0.05;
@@ -572,15 +637,21 @@ TimsBox::TimsBox() {
     // Extra late force.
     Force::Custom(forces, new MyPushForceImpl(m_brick, Vec3(.1, 0, .45),
                                                     20 * Vec3(-1,-1,.5),
-                                                    15, Infinity));
+                                                    15, 18));
     #endif
 
+    const Real CornerRadius = .1;
     for (int i=-1; i<=1; i+=2)
     for (int j=-1; j<=1; j+=2)
     for (int k=-1; k<=1; k+=2) {
         const Vec3 pt = Vec3(i,j,k).elementwiseMultiply(BrickHalfDims);
-        PointPlaneContact* contact = new PointPlaneContact
-           (Ground, YAxis, 0., m_brick, pt, CoefRest, mu_s, mu_d, mu_v);
+        //PointPlaneContact* contact = new PointPlaneContact
+         //  (Ground, YAxis, 0., m_brick, pt, CoefRest, mu_s, mu_d, mu_v);
+        SpherePlaneContact* contact = new SpherePlaneContact
+           (Ground, YAxis, 0., m_brick, pt, CornerRadius,
+            CoefRest, mu_s, mu_d, mu_v);
+        m_brick.addBodyDecoration(pt,
+            DecorativeSphere(CornerRadius).setColor(Gray).setOpacity(.5));
         matter.adoptUnilateralContact(contact);
 
         if (i==-1 && j==-1 && k==-1)
@@ -593,6 +664,23 @@ TimsBox::TimsBox() {
         //  (Ground, YAxis, 0., m_brick3, pt, CoefRest, mu_s, mu_d, mu_v);
         //matter.adoptUnilateralContact(contact3);
     }
+
+    // Midline contacts
+    for (int i=-1; i<=1; i+=2)
+    for (int j=-1; j<=1; j+=2) {
+        const Vec3 pt = Vec3(i,j,0).elementwiseMultiply(BrickHalfDims);
+        //PointPlaneContact* contact = new PointPlaneContact
+        //   (Ground, YAxis, 0., m_brick, pt, CoefRest, mu_s, mu_d, mu_v);
+        SpherePlaneContact* contact = new SpherePlaneContact
+           (Ground, YAxis, 0., m_brick, pt, CornerRadius,
+            CoefRest, mu_s, mu_d, mu_v);
+        m_brick.addBodyDecoration(pt,
+            DecorativeSphere(CornerRadius).setColor(Gray).setOpacity(.5));
+        matter.adoptUnilateralContact(contact);
+
+        PointPlaneContact* contact2 = new PointPlaneContact
+           (Ground, YAxis, 0., m_brick2, pt, CoefRest, mu_s, mu_d, mu_v);
+        matter.adoptUnilateralContact(contact2);    }
 }
 
 //---------------------------- CALC INITIAL STATE ------------------------------
@@ -644,6 +732,9 @@ void TimsBox::calcInitialState(State& s) const {
 //==============================================================================
 //                              BOUNCING BALLS
 //==============================================================================
+static const Real Separation = 0*.0011;
+static const Real Gravity = 9.8066;
+static const Real Heavy = 10; // ratio Heavy:Light
 
 BouncingBalls::BouncingBalls() {
     m_tracker       = new ContactTrackerSubsystem(*this);
@@ -656,7 +747,7 @@ BouncingBalls::BouncingBalls() {
 
 
     // Build the multibody system.
-    m_gravity = Force::Gravity(forces, matter, -YAxis, 9.8066);
+    m_gravity = Force::Gravity(forces, matter, -YAxis, Gravity);
     //m_damper  = Force::GlobalDamper(forces, matter, .1);
 
     const Real BallMass = 1;
@@ -701,7 +792,7 @@ BouncingBalls::BouncingBalls() {
                                         UnitInertia::sphere(BallRadius)));
     ballBody.addDecoration(Transform(), DecorativeSphere(BallRadius));
 
-    Body::Rigid ballBody_heavy(MassProperties(100*BallMass, Vec3(0), 
+    Body::Rigid ballBody_heavy(MassProperties(Heavy*BallMass, Vec3(0), 
                                         UnitInertia::sphere(BallRadius)));
     ballBody_heavy.addDecoration(Transform(), DecorativeSphere(BallRadius));
 
@@ -747,16 +838,15 @@ BouncingBalls::BouncingBalls() {
         m_Pballs[i].updBody().updDecoration(0).setColor(PColor);
         //Real cor = i==NBalls/2 ? .5 : CoefRest; // middle ball different
         Real cor = CoefRest;
-        matter.adoptUnilateralContact(new PointPlaneContact
+        matter.adoptUnilateralContact(new PointPlaneFrictionlessContact
                (m_Pballs[i-1], YAxis, BallRadius, 
-                m_Pballs[i], Vec3(0,-BallRadius,0), cor, 0, 0, 0));
+                m_Pballs[i], Vec3(0,-BallRadius,0), cor));
     }
 
 #endif
 
 }
 
-static const Real Separation = 0*.0011;
 void BouncingBalls::calcInitialState(State& s) const {
     const Real Height = 1;
     const Real Speed = -2;
@@ -781,7 +871,7 @@ void BouncingBalls::calcInitialState(State& s) const {
 }
 
 //==============================================================================
-//                              PENCIL
+//                                  PENCIL
 //==============================================================================
 
 Pencil::Pencil() {
@@ -801,12 +891,14 @@ Pencil::Pencil() {
     const Real PencilMass = 1;
     const Real PencilRadius = .25;
     const Real PencilHLength = 5;
-    const Real CoefRest = 1;
+    const Real CoefRest = .75;
+    const Real StopCoefRest = .7;
     const Real CaptureVelocity = .001;
-    const Real TransitionVelocity = .001;
-    //const Real mu_d=10, mu_s=10, mu_v=0;
-    const Real mu_d=1, mu_s=1, mu_v=0;
-    //const Real mu_d=.5, mu_s=.5, mu_v=0;
+    const Real TransitionVelocity = .01;
+    //const Real mu_d=10, mu_s=10, mu_v=0; // TODO: PAINLEVE!
+    //const Real mu_d=1, mu_s=1, mu_v=0;
+    const Real mu_d=.3, mu_s=.4, mu_v=0;
+    //const Real mu_d=0, mu_s=0, mu_v=0;
 
     setDefaultLengthScale(PencilHLength);
 
@@ -849,29 +941,217 @@ Pencil::Pencil() {
     m_pencil = MobilizedBody::Planar
        (Ground, Vec3(0,PencilHLength,0), pencilBody, Vec3(0));
 
+    const Real flapperRadius = 0.2;
+    m_flapper = MobilizedBody::Pin
+       (m_pencil, Vec3(0), 
+        MassProperties(10,Vec3(0),UnitInertia(0)), Vec3(-2,0,0));
+    m_flapper.addBodyDecoration(Vec3(0), DecorativeLine(Vec3(-2,0,0),Vec3(0)));
+    HardStopLower* lower =
+        new HardStopLower(m_flapper, MobilizerQIndex(0), -Pi/6, StopCoefRest); 
+    matter.adoptUnilateralContact(lower);
+    HardStopUpper* upper =
+        new HardStopUpper(m_flapper, MobilizerQIndex(0), Pi/6, StopCoefRest); 
+    matter.adoptUnilateralContact(upper);
+    SpherePlaneContact* flapperContact =
+        new SpherePlaneContact(Ground, YAxis, 0.,
+                                    m_flapper, Vec3(0), flapperRadius,
+                                    CoefRest/2, mu_s, mu_d, mu_v);
+    matter.adoptUnilateralContact(flapperContact);
+    m_flapper.addBodyDecoration(Vec3(0,0,0), 
+                              DecorativeSphere(flapperRadius).setColor(Red));
 
-    PointPlaneContact* pc1 =
-        new PointPlaneContact(Ground, YAxis, 0.,
-                                    m_pencil, Vec3(0,-PencilHLength,0), 
-                                    CoefRest, mu_s, mu_d, mu_v);
+    //PointPlaneContact* pc1 =
+    //    new PointPlaneContact(Ground, YAxis, 0.,
+    //                                m_pencil, Vec3(0,-PencilHLength,0), 
+    //                                CoefRest, mu_s, mu_d, mu_v);
+    Real radius1 = 1;
+    m_pencilSphereCenter = Vec3(0,-PencilHLength,0);
+    SpherePlaneContact* pc1 =
+        new SpherePlaneContact(Ground, YAxis, 0.,
+                                    m_pencil, m_pencilSphereCenter, radius1,
+                                    CoefRest/3, mu_s, mu_d, mu_v);
+    m_pencil.addBodyDecoration(m_pencilSphereCenter, 
+        DecorativeSphere(radius1).setColor(Cyan).setOpacity(.5)
+        .setResolution(3));
+    m_pencil.addBodyDecoration(m_pencilSphereCenter, 
+        DecorativeSphere(radius1).setColor(Black).
+        setRepresentation(DecorativeGeometry::DrawWireframe));
     PointPlaneContact* pc2 =
         new PointPlaneContact(Ground, YAxis, 0.,
                                     m_pencil, Vec3(0,PencilHLength,0), 
                                     CoefRest, mu_s, mu_d, mu_v);
     matter.adoptUnilateralContact(pc1);
     matter.adoptUnilateralContact(pc2);
+
+    const Real BallRad = 2, BallMass = 20;
+    m_ball = MobilizedBody::Free(Ground, Vec3(0),
+        MassProperties(BallMass, Vec3(0), UnitInertia::sphere(BallRad)),
+        Vec3(0));
+    m_ball.addBodyDecoration(Vec3(0), 
+                             DecorativeSphere(BallRad).setColor(Red)
+                             .setResolution(3).setOpacity(.25));
+    m_ball.addBodyDecoration(Vec3(0), 
+                             DecorativeSphere(BallRad).setColor(Black)
+                             .setRepresentation(DecorativeGeometry::DrawWireframe)
+                             );
+    SpherePlaneContact* pc3 =
+        new SpherePlaneContact(Ground, YAxis, 0.,
+                               m_ball, Vec3(0), BallRad,
+                               CoefRest/3, mu_s, mu_d, mu_v);
+    matter.adoptUnilateralContact(pc3);
+
+    SphereSphereContact* ss1 =
+        new SphereSphereContact(m_pencil, m_pencilSphereCenter, radius1,
+                                m_ball, Vec3(0), BallRad,
+                                CoefRest/2, mu_s, mu_d, mu_v);
+    matter.adoptUnilateralContact(ss1);
+
+
+    SphereSphereContact* ss2 =
+        new SphereSphereContact(m_flapper, Vec3(0), flapperRadius,
+                                m_ball, Vec3(0), BallRad,
+                                CoefRest/2, mu_s, mu_d, mu_v);
+    matter.adoptUnilateralContact(ss2);
+
+    Force::TwoPointLinearSpring(forces, m_pencil, m_pencilSphereCenter,
+                                m_ball, Vec3(0), 7.5, 0);
+
+    Rope* rope =
+        new Rope(Ground, Vec3(1,10,-1),
+                 m_ball, Vec3(0,BallRad,0),
+                 6.5, 1);
+    matter.adoptUnilateralContact(rope);
 }
+
+void Pencil::addRubberBandLines(Visualizer& viz) const {
+    viz.addRubberBandLine(m_pencil, m_pencilSphereCenter,
+                          m_ball,   Vec3(0),
+                          DecorativeLine().setColor(Orange).setLineThickness(3));
+}
+
 
 void Pencil::calcInitialState(State& s) const {
     s = realizeTopology(); // returns a reference to the the default state   
     realizeModel(s); // define appropriate states for this System
     realize(s, Stage::Instance); // instantiate constraints if any
     realize(s, Stage::Position);
-    Assembler(*this).setErrorTolerance(1e-6).assemble(s);
-    getPencil().setOneQ(s, MobilizerQIndex(0), Pi/4);
-    getPencil().setOneQ(s, MobilizerQIndex(2), -1);
+    getPencil().setOneQ(s, MobilizerQIndex(0), .01);
+    getPencil().setOneQ(s, MobilizerQIndex(2), 2);
+    //getPencil().setOneQ(s, MobilizerQIndex(0), Pi/4);
+    //getPencil().setOneQ(s, MobilizerQIndex(2), -1);
     getPencil().setOneU(s, MobilizerUIndex(1), 2);
     getPencil().setOneU(s, MobilizerUIndex(2), -2);
+
+    getBall().setQToFitTranslation(s, Vec3(-3,3,1));
+    getBall().setUToFitAngularVelocity(s, Vec3(4,5,-20));
+    Assembler(*this).setErrorTolerance(1e-6).assemble(s);
+
+}
+
+
+//==============================================================================
+//                                 BLOCK
+//==============================================================================
+Block::Block() {
+    // Abbreviations.
+    SimbodyMatterSubsystem&     matter = updMatterSubsystem();
+    GeneralForceSubsystem&      forces = updForceSubsystem();
+    MobilizedBody&              Ground = matter.updGround();
+
+    // Build the multibody system.
+    m_gravity = Force::Gravity(forces, matter, -YAxis, 50);
+    //m_damper  = Force::GlobalDamper(forces, matter, .1);
+
+
+    // Control gains
+    const Real Kp1 = 50000; // link1-2 joint stiffness
+    const Real Kp2 = 10000; // link2-3 joint stiffness
+    const Real Cd1 = /*30*/100;    // link1-2 joint damping
+    const Real Cd2 = 30;    // link2-3 joint damping
+
+    // Target angles
+    const Real Target1 = 0;
+    const Real Target2 = Pi/4;
+
+    const Vec3 Cube(.5,.5,.5); // half-dimensions of cube
+    const Real Mass1=100, Mass2=20, Mass3=1;
+    const Vec3 Centroid(.5,.5,0), Offset(0,0,-.5);
+    const Vec3 COM1=Centroid, COM2=Centroid, COM3=Centroid+0*Offset;
+    const Inertia Inertia1=Inertia(Vec3(1))  .shiftFromMassCenter(-COM1,Mass1);
+    const Inertia Inertia2=Inertia(Vec3(.05)).shiftFromMassCenter(-COM2,Mass2);
+    const Inertia Inertia3=Inertia(Vec3(.001,.001,0))
+                                             .shiftFromMassCenter(-COM3,Mass3);
+
+
+    const Real CoefRest = 0;
+    const Real CaptureVelocity = .001;
+    const Real TransitionVelocity = .01;
+    const Real mu_s = 0.15, mu_d = 0.1, mu_v = 0;
+    //const Real mu_s = 1, mu_d = 1, mu_v = 0;
+
+    setDefaultLengthScale(Cube.norm());
+
+    m_captureVelocity = CaptureVelocity;
+    m_transitionVelocity = TransitionVelocity;
+
+        // ADD MOBILIZED BODIES AND CONTACT CONSTRAINTS
+    Ground.addBodyDecoration(Vec3(0,.05,0), DecorativeFrame(2).setColor(Green));
+    DecorativeBrick drawCube(Cube); drawCube.setOpacity(0.5).setColor(Gray);
+
+    Body::Rigid blockBody(MassProperties(Mass1, COM1, Inertia1)); 
+    blockBody.addDecoration(Centroid,drawCube);
+    blockBody.addDecoration(COM1, DecorativePoint());
+
+    m_block = MobilizedBody::Free(Ground, Vec3(0), blockBody, Vec3(0));
+
+    for (int i=-1; i<=1; i+=2)
+    for (int j=-1; j<=1; j+=2)
+    for (int k=-1; k<=1; k+=2) {
+        const Vec3 pt = Centroid + Vec3(i,j,k).elementwiseMultiply(Cube);
+        PointPlaneContact* contact = new PointPlaneContact
+           (Ground, YAxis, 0., m_block, pt, CoefRest, mu_s, mu_d, mu_v);
+        matter.adoptUnilateralContact(contact);
+    }
+
+    Body::Rigid link2Info(MassProperties(Mass2, COM2, Inertia2));
+    link2Info.addDecoration(Centroid, drawCube);
+
+    Body::Rigid link3Info(MassProperties(Mass3, COM3, Inertia3));
+    link3Info.addDecoration(Centroid, drawCube);    
+    //m_link2 = MobilizedBody::Pin(m_block, Vec3(2*Centroid), 
+    //                                link2Info, Vec3(0));
+    //m_link3 = MobilizedBody::Pin(m_link2, Vec3(2*Centroid), 
+    //                                link3Info, Vec3(0));
+
+    Force::ConstantTorque(forces, m_block, Vec3(0,0,-2000));
+
+    // It is more stable to build the springs into the mechanism like
+    // this rather than apply them discretely.
+    //Force::MobilityLinearSpring
+    //   (forces, m_link2, MobilizerQIndex(0), Kp1/10, Target1);
+    //Force::MobilityLinearSpring
+     //  (forces, m_link3, MobilizerQIndex(0), Kp2, Target2);
+    //Force::MobilityLinearDamper
+        //(forces, m_link2, MobilizerUIndex(0), Cd1);
+   // Force::MobilityLinearDamper
+     //   (forces, m_link3, MobilizerUIndex(0), Cd2);
+}
+
+void Block::calcInitialState(State& s) const {
+    s = realizeTopology(); // returns a reference to the the default state   
+    realizeModel(s); // define appropriate states for this System
+    realize(s, Stage::Instance); // instantiate constraints if any
+    realize(s, Stage::Position);
+    Assembler(*this).setErrorTolerance(1e-6).assemble(s);
+
+    //m_link2.setQ(s, -0.1104);
+   // m_link3.setQ(s, Pi/4);
+    //m_link2.lock(s); m_link3.lock(s);
+
+    //getBlock().setQToFitTranslation(s, Vec3(0,.2,0));
+    //getBlock().setQToFitRotation(s, Rotation(Pi/20,ZAxis));
+    getBlock().setUToFitLinearVelocity(s, Vec3(.2,0,0));
+
 }
 
 //-------------------------- SHOW CONSTRAINT STATUS ----------------------------

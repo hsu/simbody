@@ -48,6 +48,7 @@ will include this one). **/
 #include "simbody/internal/MobilizedBody.h"
 #include "simbody/internal/MobilizedBody_BuiltIns.h"
 #include "simbody/internal/Constraint.h"
+#include "simbody/internal/Constraint_BuiltIns.h"
 #include "simbody/internal/ElasticFoundationForce.h"
 #include "simbody/internal/Force.h"
 #include "simbody/internal/Force_BuiltIns.h"
@@ -74,5 +75,8 @@ will include this one). **/
 #include "simbody/internal/Visualizer_Reporter.h"
 #include "simbody/internal/ConditionalConstraint.h"
 #include "simbody/internal/SemiExplicitEulerTimeStepper.h"
+#include "simbody/internal/ImpulseSolver.h"
+#include "simbody/internal/PGSImpulseSolver.h"
+#include "simbody/internal/PLUSImpulseSolver.h"
 
 #endif // SimTK_SIMBODY_SimTKSIMBODY_H_
