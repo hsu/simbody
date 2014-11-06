@@ -92,6 +92,8 @@ IF(BUILD_USING_NAMESPACE)
     SET(NS "${BUILD_USING_NAMESPACE}_")
 ENDIF(BUILD_USING_NAMESPACE)
 
+# Ensure that debug libraries have "_d" appended to their names.
+SET(CMAKE_DEBUG_POSTFIX "_d")
 
 #
 # These are the names of all the libraries we may generate. These are
@@ -180,20 +182,6 @@ IF(BUILD_EXAMPLES AND NOT (BUILD_TESTS_AND_EXAMPLES_STATIC OR
         "BUILD_TESTS_AND_EXAMPLES_SHARED are both off.")
 ENDIF()
 
-#
-# Create a platform name useful for finding things in the Platform
-# directory.
-IF(WIN32)
-    SET(PLATFORM_NAME Windows)
-    SET(NATIVE_COPY_CMD copy)
-ELSEIF(APPLE)
-    SET(PLATFORM_NAME Mac)
-    SET(NATIVE_COPY_CMD cp)
-ELSE()
-    SET(PLATFORM_NAME Linux)
-    SET(NATIVE_COPY_CMD cp)
-ENDIF()
-
 # In addition to the platform name we need to know the Application Binary
 # Interface (ABI) we're building for. Currently that is either x86, meaning
 # 32 bit Intel instruction set, or x64 for 64 bit Intel instruction set.
@@ -204,7 +192,7 @@ ELSE()
     SET(PLATFORM_ABI x86)
 ENDIF()
 
-SET(BUILD_PLATFORM "${PLATFORM_NAME}:${PLATFORM_ABI}" CACHE STRING
+SET(BUILD_PLATFORM "${CMAKE_HOST_SYSTEM_NAME}:${PLATFORM_ABI}" CACHE STRING
     "This is the platform and ABI we're building for. Not changeable here; use a different CMake generator instead."
     FORCE)
 
@@ -226,7 +214,7 @@ IF(SimTK_INSTALL_PREFIX AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
 ENDIF()
 
 # C compiler is gcc on Linux, gcc or cc on Mac where command line tools
-# are installed from XCode. May be Clang in Mac 10.8 or later.
+# are installed from Xcode. May be Clang in Mac 10.8 or later.
 
 IF(${CMAKE_C_COMPILER} MATCHES "cc" OR ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
     IF(NOT CMAKE_INSTALL_PREFIX)
@@ -276,10 +264,10 @@ IF("${CMAKE_INSTALL_PREFIX}" STREQUAL "/usr/local" OR
 ENDIF()
 
 
-IF(UNIX AND NOT CMAKE_BUILD_TYPE)
+IF(NOT MSVC AND NOT XCODE AND NOT CMAKE_BUILD_TYPE)
     SET(CMAKE_BUILD_TYPE Release CACHE STRING "Debug or Release build" 
         FORCE)
-ENDIF (UNIX AND NOT CMAKE_BUILD_TYPE)
+ENDIF()
 
 
 ## Choose the maximum level of x86 instruction set that the compiler is 
@@ -488,12 +476,6 @@ ELSE(NEED_QUOTES)
                    -DSimTK_SIMBODY_AUTHORS=${SIMBODY_AUTHORS})
 ENDIF(NEED_QUOTES)
 
-# Ensure that debug libraries have "_d" appended to their names.
-# CMake gets this right on Windows automatically with this definition.
-# But on Unix or Cygwin we have to add the suffix manually
-IF (${CMAKE_GENERATOR} MATCHES "Visual Studio")
-    SET(CMAKE_DEBUG_POSTFIX "_d" CACHE INTERNAL "" FORCE)
-ENDIF (${CMAKE_GENERATOR} MATCHES "Visual Studio")
 
 # Determine which math libraries to use for this platform.
 # Intel MKL: mkl_intel_c_dll;mkl_sequential_dll;mkl_core_dll
@@ -565,11 +547,11 @@ IF (BUILD_TESTING)
         "Number of CPUs to be used by the RUN_TESTS_PARALLEL target.")
     MARK_AS_ADVANCED(TESTING_PROCESSOR_COUNT)
     SET (cmd ${CMAKE_CTEST_COMMAND} -j${TESTING_PROCESSOR_COUNT})
-    IF (MSVC)
+    IF(MSVC OR XCODE)
         SET (cmd ${cmd} -C ${CMAKE_CFG_INTDIR})
-    ELSE (MSVC)
+    ELSE()
         SET (cmd ${cmd} -C ${CMAKE_BUILD_TYPE})
-    ENDIF (MSVC)
+    ENDIF()
     ADD_CUSTOM_TARGET (RUN_TESTS_PARALLEL
         COMMAND ${cmd}
     )
@@ -611,6 +593,10 @@ ADD_SUBDIRECTORY( SimTKmath )
 ADD_SUBDIRECTORY( Simbody )
 # SimTKSIMBODY_INCLUDE_DIRECTORIES now set (but not used)
 
+IF( BUILD_EXAMPLES )
+  ADD_SUBDIRECTORY( examples )
+ENDIF( BUILD_EXAMPLES )
+
 FILE(GLOB TOPLEVEL_DOCS doc/*.pdf doc/*.txt)
 INSTALL(FILES ${TOPLEVEL_DOCS} DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
@@ -625,10 +611,10 @@ add_custom_target(uninstall
 # Make the cmake config files
 set(PKG_NAME ${PROJECT_NAME})
 set(PKG_LIBRARIES
-  SimTKsimbody
-  SimTKmath
-  SimTKcommon
-)
+    ${SimTKSIMBODY_LIBRARY_NAME}
+    ${SimTKMATH_LIBRARY_NAME}
+    ${SimTKCOMMON_LIBRARY_NAME}
+    )
 
 if (WIN32)
   set(SIMBODY_CMAKE_DIR cmake)
